@@ -1,0 +1,323 @@
+/**
+ * Chemistry Learning Hub - Google Apps Script backend
+ * Sheets used: Chapters, Notes, Questions, Settings
+ * IMPORTANT: Set ADMIN_USERNAME and ADMIN_PASSWORD in Script Properties before deployment.
+ * XLSX import uses the Advanced Google Drive service (Drive API v3) to convert the uploaded workbook.
+ */
+const APP_TITLE = "Ashraf's Chemistry Learning Hub";
+const SHEET_NAMES = { chapters:'Chapters', notes:'Notes', questions:'Questions', settings:'Settings' };
+const CHAPTER_HEADERS = ['ID','Class','Subject','Medium','Chapter Number','Chapter Name','Created At','Updated At'];
+const NOTE_HEADERS = ['Chapter ID','Subtopic','Content','Image_URL','Image_Position','Table_Data','Table_Position'];
+let ORIGINAL_XLSX_RICH_TEXT = {};
+const QUESTION_HEADERS = ['Chapter ID','Exam_Name','Year','Subtopic','Question_No','Common_Statement','Statement_Image_URL','Statement_Image_Position','Statement_Table_Data','Statement_Table_Position','Subquestion_Label','Question','Question_Type','Question_Image_URL','Question_Image_Position','Question_Table_Data','Question_Table_Position','Option_A','Option_B','Option_C','Option_D','Correct_Answer','Marks','Explanation','Explanation_Image_URL','Explanation_Image_Position','Explanation_Table_Data','Explanation_Table_Position'];
+
+function doGet(){
+  return HtmlService.createHtmlOutputFromFile('Index').setTitle(APP_TITLE)
+    .addMetaTag('viewport','width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+function onOpen(){ SpreadsheetApp.getUi().createMenu('Chemistry Hub').addItem('Initialize / Repair sheets','setupApp').addToUi(); }
+function setupApp(){
+  const ss=SpreadsheetApp.getActiveSpreadsheet();
+  if(!ss) throw new Error('Open this Apps Script from the database Google Sheet, then run setupApp().');
+  ensureSheet_(ss,SHEET_NAMES.chapters,CHAPTER_HEADERS);
+  ensureSheet_(ss,SHEET_NAMES.notes,NOTE_HEADERS);
+  ensureSheet_(ss,SHEET_NAMES.questions,QUESTION_HEADERS);
+  ensureSheet_(ss,SHEET_NAMES.settings,['Key','Value']);
+  const props=PropertiesService.getScriptProperties();
+  if(!props.getProperty('ADMIN_USERNAME')) props.setProperty('ADMIN_USERNAME','admin');
+  if(!props.getProperty('ADMIN_PASSWORD')) props.setProperty('ADMIN_PASSWORD','ChangeMe123!');
+  if(!props.getProperty('SPREADSHEET_ID')) props.setProperty('SPREADSHEET_ID',ss.getId());
+  return 'Setup complete. Change the default admin password in Project Settings > Script Properties.';
+}
+function ensureSheet_(ss,name,headers){
+  let sh=ss.getSheetByName(name); if(!sh) sh=ss.insertSheet(name);
+  if(sh.getLastRow()===0) sh.getRange(1,1,1,headers.length).setValues([headers]);
+  else {
+    const existing=sh.getRange(1,1,1,Math.max(sh.getLastColumn(),headers.length)).getDisplayValues()[0];
+    if(headers.some((h,i)=>existing[i]!==h)) throw new Error('Header mismatch in '+name+'. Do not rename or reorder the required columns.');
+  }
+  sh.setFrozenRows(1); return sh;
+}
+function db_(){
+  const id=PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if(id) return SpreadsheetApp.openById(id);
+  const ss=SpreadsheetApp.getActiveSpreadsheet(); if(!ss) throw new Error('Run setupApp() from the database spreadsheet first.'); return ss;
+}
+function sh_(key){const s=db_().getSheetByName(SHEET_NAMES[key]);if(!s)throw new Error('Missing sheet '+SHEET_NAMES[key]+'. Run setupApp().');return s;}
+function rows_(sheet){const v=sheet.getDataRange().getValues();if(v.length<2)return [];const h=v[0].map(String);return v.slice(1).filter(r=>r.some(x=>x!==''&&x!==null)).map(r=>{const o={};h.forEach((k,i)=>o[k]=r[i]);return o;});}
+function norm_(v){return String(v==null?'':v).trim().toLowerCase().replace(/\s+/g,' ');}
+function id_(){return Utilities.getUuid();}
+function iso_(){return new Date().toISOString();}
+function adminLogin(username,password){
+  const p=PropertiesService.getScriptProperties();
+  const u=p.getProperty('ADMIN_USERNAME')||'admin', pw=p.getProperty('ADMIN_PASSWORD')||'ChangeMe123!';
+  if(String(username)!==u||String(password)!==pw)return {ok:false,message:'Incorrect username or password.'};
+  const token=Utilities.getUuid()+Utilities.getUuid();CacheService.getScriptCache().put('admin:'+token,'1',21600);
+  return {ok:true,token:token};
+}
+function requireAdmin_(token){if(!token||CacheService.getScriptCache().get('admin:'+token)!=='1')throw new Error('Admin session expired. Please sign in again.');}
+function adminLogout(token){if(token)CacheService.getScriptCache().remove('admin:'+token);return {ok:true};}
+function getCatalog(){
+  const chapters=rows_(sh_('chapters')).map(r=>({id:String(r.ID),className:String(r.Class||''),subject:String(r.Subject||''),medium:String(r.Medium||''),chapterNo:String(r['Chapter Number']||''),chapterName:String(r['Chapter Name']||''),notesCount:0,questionsCount:0}));
+  const ns=rows_(sh_('notes')), qs=rows_(sh_('questions'));
+  chapters.forEach(c=>{c.notesCount=ns.filter(r=>String(r['Chapter ID'])===c.id).length;c.questionsCount=qs.filter(r=>String(r['Chapter ID'])===c.id).length;});
+  return {chapters:chapters};
+}
+function getChapterContent(chapterId){
+  const c=rows_(sh_('chapters')).find(r=>String(r.ID)===String(chapterId));if(!c)throw new Error('Chapter not found.');
+  const notes=rows_(sh_('notes')).filter(r=>String(r['Chapter ID'])===String(chapterId)).map(r=>({subtopic:String(r.Subtopic||''),content:String(r.Content||''),imageUrl:String(r.Image_URL||''),imagePosition:String(r.Image_Position||'TOP'),tableData:String(r.Table_Data||''),tablePosition:String(r.Table_Position||'TOP')}));
+  const questions=rows_(sh_('questions')).filter(r=>String(r['Chapter ID'])===String(chapterId)).map(r=>({examName:String(r.Exam_Name||''),year:String(r.Year||''),subtopic:String(r.Subtopic||''),questionNo:String(r.Question_No||''),commonStatement:String(r.Common_Statement||''),statementImageUrl:String(r.Statement_Image_URL||''),statementImagePosition:String(r.Statement_Image_Position||'TOP'),statementTableData:String(r.Statement_Table_Data||''),statementTablePosition:String(r.Statement_Table_Position||'TOP'),subquestionLabel:String(r.Subquestion_Label||''),question:String(r.Question||''),questionType:String(r.Question_Type||''),questionImageUrl:String(r.Question_Image_URL||''),questionImagePosition:String(r.Question_Image_Position||'TOP'),questionTableData:String(r.Question_Table_Data||''),questionTablePosition:String(r.Question_Table_Position||'TOP'),optionA:String(r.Option_A||''),optionB:String(r.Option_B||''),optionC:String(r.Option_C||''),optionD:String(r.Option_D||''),correctAnswer:String(r.Correct_Answer||''),marks:String(r.Marks==null?'':r.Marks),explanation:String(r.Explanation||''),explanationImageUrl:String(r.Explanation_Image_URL||''),explanationImagePosition:String(r.Explanation_Image_Position||'TOP'),explanationTableData:String(r.Explanation_Table_Data||''),explanationTablePosition:String(r.Explanation_Table_Position||'TOP')}));
+  return {chapter:{id:String(c.ID),className:String(c.Class||''),subject:String(c.Subject||''),medium:String(c.Medium||''),chapterNo:String(c['Chapter Number']||''),chapterName:String(c['Chapter Name']||'')},notes:notes,questions:questions};
+}
+function getAdminSummary(token){requireAdmin_(token);return getCatalog();}
+function uploadWorkbook(payload,token){
+  requireAdmin_(token);validatePayload_(payload);
+  const fileName=String(payload.fileName||'chapter.xlsx');
+  const bytes=Utilities.base64Decode(String(payload.base64||''));
+  const blob=Utilities.newBlob(bytes,payload.mimeType||'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',fileName);
+  // Read Excel rich-text runs directly from the original XLSX before Drive conversion.
+  // This preserves real subscript/superscript styling even if conversion drops it.
+  ORIGINAL_XLSX_RICH_TEXT = extractXlsxChemistryRuns_(blob);
+  let tempId='';
+  try{
+    // Requires Advanced Google Drive service enabled (Services > Drive API).
+    const resource={name:'TEMP_IMPORT_'+id_(),mimeType:'application/vnd.google-apps.spreadsheet'};
+    const converted=Drive.Files.create(resource,blob,{fields:'id,name'});tempId=converted.id;
+    const xss=SpreadsheetApp.openById(tempId);
+    const ns=xss.getSheetByName('Notes'), qs=xss.getSheetByName('Questions');
+    if(!ns||!qs)throw new Error('The Excel workbook must contain sheets named Notes and Questions.');
+    const noteRows=readSheetObjects_(ns,NOTE_HEADERS.slice(1));
+    const questionRows=readSheetObjects_(qs,QUESTION_HEADERS.slice(1));
+    if(!noteRows.length&&!questionRows.length)throw new Error('No data rows were found in Notes or Questions.');
+    const chapterSheet=sh_('chapters');const existing=rows_(chapterSheet).find(r=>norm_(r.Class)===norm_(payload.className)&&norm_(r.Subject)===norm_(payload.subject)&&norm_(r.Medium)===norm_(payload.medium)&&norm_(r['Chapter Number'])===norm_(payload.chapterNo));
+    const chapterId=existing?String(existing.ID):id_();
+    const now=iso_();
+    if(existing){
+      replaceRowsForChapter_(sh_('notes'),chapterId,NOTE_HEADERS,noteRows.map(o=>[chapterId,...NOTE_HEADERS.slice(1).map(h=>valueForHeader_(o,h))]));
+      replaceRowsForChapter_(sh_('questions'),chapterId,QUESTION_HEADERS,questionRows.map(o=>[chapterId,...QUESTION_HEADERS.slice(1).map(h=>valueForHeader_(o,h))]));
+      const rowIndex=findRowById_(chapterSheet,chapterId);
+      chapterSheet.getRange(rowIndex,1,1,CHAPTER_HEADERS.length).setValues([[chapterId,payload.className,payload.subject,payload.medium,payload.chapterNo,payload.chapterName,existing['Created At']||now,now]]);
+    }else{
+      chapterSheet.appendRow([chapterId,payload.className,payload.subject,payload.medium,payload.chapterNo,payload.chapterName,now,now]);
+      appendObjects_(sh_('notes'),NOTE_HEADERS,noteRows,chapterId);
+      appendObjects_(sh_('questions'),QUESTION_HEADERS,questionRows,chapterId);
+    }
+    return {ok:true,message:existing?'Chapter data replaced successfully.':'Chapter uploaded and published successfully.',notesCount:noteRows.length,questionsCount:questionRows.length,chapterId:chapterId};
+  }finally{if(tempId){try{DriveApp.getFileById(tempId).setTrashed(true);}catch(e){}}}
+}
+function validatePayload_(p){if(!p)throw new Error('Missing upload data.');['className','subject','medium','chapterNo','chapterName','base64'].forEach(k=>{if(!String(p[k]||'').trim())throw new Error('Missing required field: '+k);});if(!/^\.xlsx$/i.test('.'+String(p.fileName||'').split('.').pop()))throw new Error('Please upload an .xlsx workbook.');}
+function readSheetObjects_(sheet,expected){
+  const range=sheet.getDataRange();
+  const display=range.getDisplayValues();
+  const raw=range.getValues();
+  if(display.length<2)return [];
+  const rich=range.getRichTextValues();
+
+  // Find the real header row (some Excel exports insert a title/blank row above it).
+  const cleanHeader = v => String(v==null?'':v)
+    .replace(/[\uFEFF\u00A0\u200B]/g,' ')
+    .replace(/[\r\n]+/g,' ').trim();
+  const keyOf = v => norm_(cleanHeader(v)).replace(/[^a-z0-9]/g,'');
+  const expectedKeys=expected.map(keyOf);
+  let headerRow=-1, bestMatches=-1;
+  const scanLimit=Math.min(display.length,10);
+  for(let r=0;r<scanLimit;r++){
+    const keys=display[r].map(keyOf);
+    const matches=expectedKeys.filter(k=>keys.includes(k)).length;
+    if(matches>bestMatches){bestMatches=matches;headerRow=r;}
+  }
+  // Alias common header variants without changing the destination schema.
+  const aliases={
+    questionno:['questionnumber','questionno.','qno','questionnumber.','question'],
+    year:['examyear','yearofexam','year.'],
+    examname:['exam','examination','examname.'],
+    subquestionlabel:['subquestion','subquestionlabel.']
+  };
+  if(headerRow<0 || bestMatches < Math.min(expected.length,3))
+    throw new Error('Could not identify the header row in '+sheet.getName()+'. Found first rows: '+display.slice(0,Math.min(5,display.length)).map(r=>r.join(' | ')).join(' / '));
+
+  const headers=display[headerRow].map(cleanHeader);
+  const headerIndex={};
+  headers.forEach((h,i)=>{const k=keyOf(h);if(k && headerIndex[k]===undefined)headerIndex[k]=i;});
+  Object.keys(aliases).forEach(target=>{
+    if(headerIndex[target]!==undefined)return;
+    for(const alias of aliases[target]){
+      const k=keyOf(alias);
+      if(headerIndex[k]!==undefined){headerIndex[target]=headerIndex[k];break;}
+    }
+  });
+  const missing=expected.filter(h=>headerIndex[keyOf(h)]===undefined);
+  if(missing.length)throw new Error('Sheet '+sheet.getName()+' is missing required column(s): '+missing.join(', ')+'. Found headers: '+headers.join(' | '));
+
+  const originalSheet=ORIGINAL_XLSX_RICH_TEXT[sheet.getName()]||{};
+  const output=[];
+  for(let r=headerRow+1;r<display.length;r++){
+    const row=display[r];
+    if(!row.some(v=>String(v==null?'':v).trim()!==''))continue;
+    const o={};
+    expected.forEach(h=>{
+      const idx=headerIndex[keyOf(h)];
+      let value=row[idx];
+      // Prefer the actual cell value for Year and Question_No so numeric cells are not lost.
+      if(keyOf(h)==='year' || keyOf(h)==='questionno'){
+        const rv=raw[r][idx];
+        value=(rv!=='' && rv!==null && rv!==undefined)?String(rv).trim():String(row[idx]||'').trim();
+      } else {
+        const original=originalSheet[String(r+1)+':'+String(idx+1)];
+        if(original!==undefined && original!==null && original!=='') value=original;
+        else if(rich[r] && rich[r][idx]) value=richTextChemistryText_(value,rich[r][idx]);
+      }
+      o[h]=value==null?'':value;
+    });
+    output.push(o);
+  }
+  return output;
+}
+/**
+ * Extract rich-text subscript/superscript from the original XLSX package.
+ * XLSX rich text is stored in xl/sharedStrings.xml as runs with
+ * <vertAlign val="subscript|superscript"/>. This avoids depending on Google
+ * Drive's XLSX-to-Sheets conversion retaining character-level formatting.
+ * Returns { sheetName: { "row:col": "H₂O" } } for cells that have styled runs.
+ */
+function extractXlsxChemistryRuns_(blob) {
+  const result = {};
+  try {
+    const files = Utilities.unzip(blob);
+    const byName = {};
+    files.forEach(f => byName[f.getName()] = f);
+    const sharedFile = byName['xl/sharedStrings.xml'];
+    const workbookFile = byName['xl/workbook.xml'];
+    const relsFile = byName['xl/_rels/workbook.xml.rels'];
+    if (!sharedFile || !workbookFile || !relsFile) return result;
+    const sharedXml = sharedFile.getDataAsString('UTF-8');
+    const workbookXml = workbookFile.getDataAsString('UTF-8');
+    const relsXml = relsFile.getDataAsString('UTF-8');
+    const shared = [];
+    const siMatches = sharedXml.match(/<si(?:\s[^>]*)?>[\s\S]*?<\/si>/g) || [];
+    siMatches.forEach(si => {
+      const runs = si.match(/<r(?:\s[^>]*)?>[\s\S]*?<\/r>/g);
+      if (!runs) {
+        shared.push({text: decodeXmlText_((si.match(/<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/)||[])[1] || ''), styled:false});
+        return;
+      }
+      let text = '', styled = false;
+      runs.forEach(run => {
+        const raw = (run.match(/<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/) || [,''])[1];
+        const decoded = decodeXmlText_(raw);
+        const props = (run.match(/<rPr(?:\s[^>]*)?>[\s\S]*?<\/rPr>/) || [''])[0];
+        const va = (props.match(/<vertAlign\b[^>]*\bval=["']([^"']+)["']/) || [,''])[1].toLowerCase();
+        if (va === 'subscript') { text += toUnicodeChemistryDigits_(decoded,'sub'); styled = true; }
+        else if (va === 'superscript') { text += toUnicodeChemistryDigits_(decoded,'sup'); styled = true; }
+        else text += decoded;
+      });
+      shared.push({text:text,styled:styled});
+    });
+    const relMap = {};
+    (relsXml.match(/<Relationship\b[^>]*\/>/g)||[]).forEach(tag => {
+      const id=(tag.match(/\bId=["']([^"']+)["']/)||[])[1];
+      const target=(tag.match(/\bTarget=["']([^"']+)["']/)||[])[1];
+      if(id && target) relMap[id] = target.indexOf('/')===0 ? target.substring(1) : 'xl/'+target.replace(/^\.\//,'');
+    });
+    const sheetFiles = {};
+    (workbookXml.match(/<sheet\b[^>]*\/>/g)||[]).forEach(tag => {
+      const name=(tag.match(/\bname=["']([^"']+)["']/)||[])[1];
+      const rid=(tag.match(/\br:id=["']([^"']+)["']/)||[])[1];
+      if(name && rid && relMap[rid]) sheetFiles[name] = relMap[rid].replace(/\\/g,'/');
+    });
+    Object.keys(sheetFiles).forEach(sheetName => {
+      const file = byName[sheetFiles[sheetName]];
+      if(!file) return;
+      const xml=file.getDataAsString('UTF-8');
+      const map={};
+      (xml.match(/<c\b[^>]*>[\s\S]*?<\/c>/g)||[]).forEach(cell => {
+        const ref=(cell.match(/\br=["']([A-Z]+\d+)["']/)||[])[1];
+        const type=(cell.match(/\bt=["']([^"']+)["']/)||[])[1]||'';
+        if(!ref) return;
+        let richCell=null;
+        if(type==='s'){
+          const idx=Number((cell.match(/<v>(\d+)<\/v>/)||[])[1]);
+          if(Number.isFinite(idx) && shared[idx] && shared[idx].styled) richCell=shared[idx];
+        }else if(type==='inlineStr'){
+          // Some XLSX producers store rich-text cells inline instead of in sharedStrings.xml.
+          // Read styled runs here too so Excel superscript/subscript is not lost on conversion.
+          const inline=(cell.match(/<is(?:\s[^>]*)?>[\s\S]*?<\/is>/)||[])[0]||'';
+          const runs=inline.match(/<r(?:\s[^>]*)?>[\s\S]*?<\/r>/g)||[];
+          if(runs.length){
+            let text='',styled=false;
+            runs.forEach(run=>{
+              const raw=(run.match(/<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/)||[,''])[1];
+              const decoded=decodeXmlText_(raw);
+              const props=(run.match(/<rPr(?:\s[^>]*)?>[\s\S]*?<\/rPr>/)||[''])[0];
+              const va=(props.match(/<vertAlign\b[^>]*\bval=["']([^"']+)["']/)||[,''])[1].toLowerCase();
+              if(va==='subscript'){text+=toUnicodeChemistryDigits_(decoded,'sub');styled=true;}
+              else if(va==='superscript'){text+=toUnicodeChemistryDigits_(decoded,'sup');styled=true;}
+              else text+=decoded;
+            });
+            if(styled)richCell={text:text,styled:true};
+          }
+        }
+        if(!richCell || !richCell.styled) return;
+        const pos=ref.match(/^([A-Z]+)(\d+)$/); if(!pos) return;
+        let col=0; for(let i=0;i<pos[1].length;i++) col=col*26+pos[1].charCodeAt(i)-64;
+        map[pos[2]+':'+col]=richCell.text;
+      });
+      if(Object.keys(map).length) result[sheetName]=map;
+    });
+  } catch (err) {
+    // Continue with the normal importer if the XLSX package uses an unsupported layout.
+    console.warn('Could not read original XLSX rich-text runs: '+err);
+  }
+  return result;
+}
+function decodeXmlText_(s) {
+  return String(s||'').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&amp;/g,'&');
+}
+
+function richTextChemistryText_(displayValue,richValue){
+  if(!richValue||typeof richValue.getRuns!=='function')return String(displayValue==null?'':displayValue);
+  try{
+    const runs=richValue.getRuns();
+    if(!runs||!runs.length)return String(displayValue==null?'':displayValue);
+    let out='';
+    runs.forEach(run=>{
+      const text=run.getText();
+      let offset='';
+      try{
+        const style=run.getTextStyle();
+        if(style&&typeof style.getBaselineOffset==='function')offset=String(style.getBaselineOffset()||'').toUpperCase();
+      }catch(e){}
+      if(offset.indexOf('SUBSCRIPT')>=0)out+=toUnicodeChemistryDigits_(text,'sub');
+      else if(offset.indexOf('SUPERSCRIPT')>=0)out+=toUnicodeChemistryDigits_(text,'sup');
+      else out+=text;
+    });
+    return out;
+  }catch(e){return String(displayValue==null?'':displayValue);}
+}
+function toUnicodeChemistryDigits_(text,kind){
+  const sub={'0':'₀','1':'₁','2':'₂','3':'₃','4':'₄','5':'₅','6':'₆','7':'₇','8':'₈','9':'₉','+':'₊','-':'₋','−':'₋'};
+  const sup={'0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹','+':'⁺','-':'⁻','−':'⁻'};
+  const map=kind==='sub'?sub:sup;
+  return String(text||'').split('').map(ch=>map[ch]||ch).join('');
+}
+function valueForHeader_(o,h){const key=Object.keys(o).find(k=>norm_(k)===norm_(h));return key===undefined?'':o[key];}
+function appendObjects_(sheet,headers,objects,chapterId){if(!objects.length)return;const rows=objects.map(o=>[chapterId,...headers.slice(1).map(h=>valueForHeader_(o,h))]);sheet.getRange(sheet.getLastRow()+1,1,rows.length,headers.length).setValues(rows);}
+function replaceRowsForChapter_(sheet,chapterId,headers,newRows){
+  const data=sheet.getDataRange().getValues();const kept=data.length? [data[0]]: [headers];
+  for(let i=1;i<data.length;i++)if(String(data[i][0])!==String(chapterId))kept.push(data[i]);
+  sheet.clearContents();sheet.getRange(1,1,1,headers.length).setValues([headers]);
+  const oldRows=kept.slice(1);if(oldRows.length)sheet.getRange(2,1,oldRows.length,headers.length).setValues(oldRows);
+  if(newRows.length)sheet.getRange(sheet.getLastRow()+1,1,newRows.length,headers.length).setValues(newRows);
+}
+function findRowById_(sheet,id){const vals=sheet.getRange(2,1,Math.max(sheet.getLastRow()-1,1),1).getDisplayValues();for(let i=0;i<vals.length;i++)if(vals[i][0]===String(id))return i+2;throw new Error('Chapter record not found.');}
+function deleteChapter(chapterId,token){
+  requireAdmin_(token);if(!chapterId)throw new Error('Missing chapter ID.');
+  const lock=LockService.getScriptLock();lock.waitLock(10000);
+  try{
+    const cs=sh_('chapters'), row=findRowById_(cs,chapterId);
+    deleteRowsByChapter_(sh_('notes'),chapterId);deleteRowsByChapter_(sh_('questions'),chapterId);cs.deleteRow(row);
+    return {ok:true,message:'Chapter and its Notes/Questions data have been deleted.'};
+  }finally{lock.releaseLock();}
+}
+function deleteRowsByChapter_(sheet,id){for(let r=sheet.getLastRow();r>=2;r--)if(String(sheet.getRange(r,1).getDisplayValue())===String(id))sheet.deleteRow(r);}
